@@ -1,0 +1,205 @@
+---
+title: "Santi_Ext"
+output: pdf_document
+date: "2024-02-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(Lab.Data.Prep)
+library(hms)
+library(openxlsx)
+```
+
+#Import Files
+```{r}
+raw<-Lab.Data.Prep::extract("TD",c("01","02","03","04","05","06","07","08","09","10"),filepath = '/Users/admin/Documents/Ext_Burst/santi/')
+```
+
+#Load Functions
+```{r}
+mpc_b<-function(x, array, endarray) {
+  # parsing text array into a data frame
+  if (stringr::str_detect(array, "[:upper:]") == FALSE) {
+    array <- toupper(array)
+  }
+  
+    if (stringr::str_detect(endarray, "[:upper:]") == FALSE) {
+    endarray <- toupper(endarray)
+  }
+
+  startarray <- paste(array, ":", sep = "")
+  endarray <- paste(endarray, ":", sep = "")
+  new_vec <- vector("list", length(x))
+for (c in seq_along(x)) {
+    text_data <- data.frame()
+    text_data <- rbind(text_data, x[[c]])
+
+    suppressWarnings(split_data <- tidyr::separate(text_data,
+      col = 1,
+      into = c(
+        "Col1", "Col2", "Col3", "Col4", "Col5",
+        "Col6", "Col7"
+      ),
+      sep = " +"
+    ))
+    id <- split_data[3, 2]
+    start_row <- which(split_data$Col1 == startarray)
+    end_row <- which(split_data$Col1 == endarray)
+    filtered_data <- dplyr::filter(
+      split_data,
+      dplyr::row_number() %in% (start_row + 1):(end_row - 1)
+    )
+    wide_data <- data.frame()
+    col_index <- 1
+    for (i in seq_len(nrow(filtered_data))) {
+      for (j in 3:7) {
+        wide_data[1, col_index] <- filtered_data[i, j]
+        col_index <- col_index + 1
+      }
+    }
+   wide_data<-wide_data[ , colSums(is.na(wide_data))==0]
+   wide_data<-wide_data %>% dplyr::mutate_if(is.character,as.numeric)
+
+    colnames(wide_data) <- paste(array,c(0:(ncol(wide_data)-1)), sep = "")
+    new_vec[[c]] <- wide_data
+  }
+
+  # merge data frames from list into one data frame
+  merged_df <- do.call(bind_rows, Map(cbind, session = seq_along(new_vec), new_vec))
+  merged_df$id <- id
+  #reorder columns so id is visible
+  merged_df<-merged_df[,c(ncol(merged_df),1:ncol(merged_df)-1)]
+  return(merged_df)
+}
+```
+
+```{r}
+start_times<- function(x) {
+end_time<-vector()
+session_time<-vector()
+  for (c in seq_along(x)) {
+    text_data <- data.frame()
+    text_data <- rbind(text_data, x[[c]])
+
+suppressWarnings(split_data <- tidyr::separate(text_data,
+      col = 1,
+      into = c(
+        "Col1", "Col2", "Col3"
+      ),
+      sep = " +"
+    ))
+end_time[c]<-split_data[8,3]
+ifelse(c==1,session_time[c]<-as.numeric(split_data[52,3]),session_time[c]<-as.numeric(split_data[51,3]) )
+  }
+end_time<-as.POSIXct(end_time, format = "%H:%M:%S")
+start_time<-end_time-(session_time/100)
+daily_diff<-end_time-start_time
+start_time<-as_hms(start_time)
+end_time<-as_hms(end_time)
+start_end_time<-data.frame(start_time,end_time,daily_diff)
+start_end_time$diff[1]<-0
+for(i in 2:length(start_end_time$diff)){
+  start_end_time$diff[i]<-((start_end_time$start_time[i]-start_end_time$end_time[i-1])/60)+1440
+}
+return(start_end_time)
+}
+
+```
+
+#Create List of Session Start and End Times + Time Between Sessions
+```{r}
+times<-list()
+for(i in 1:length(raw)){
+  times[[i]]<-start_times(raw[[i]])
+times[[i]]$cum_time<-cumsum(times[[i]]$diff)
+}
+
+```
+
+#Create Data Frames
+```{r}
+#Data frame for target responses
+g<-list()
+for (i in 1:length(raw)) {
+  g[[i]]<-mpc_b(raw[[i]],"g","h")
+  print(i)
+}
+
+g<-do.call("rbind", g)
+
+colnames(g)<-stringr::str_replace_all(colnames(g),'G','target_') 
+
+#Data frame for pellets
+p<-list()
+for (i in 1:length(raw)) {
+  p[[i]]<-mpc_b(raw[[i]],"i","j")
+  print(i)
+}
+
+p<-do.call("rbind", p)
+colnames(p)<-stringr::str_replace_all(colnames(p),'I','pellet_')
+
+#Merge target and pellet data frames
+df <- merge(g,p,by=c("id","session"))
+df<-df[,c(1:2,4:14,16:26)]
+
+df = pivot_longer(df,
+             cols = c(3:24),
+             names_to = c("variable","minute"),
+             names_sep = "_",
+             values_to = "count"
+             )
+df = pivot_wider(df,
+             names_from = "variable",
+             values_from = "count"
+             )
+df$minute<-as.numeric(df$minute)
+
+#Correct session 1 minute 1 bin from faulty medpc code
+df<-df %>% 
+  filter(session<16&minute<6 |session==16 )
+df$target[df$session == 1 & df$minute == 1]<-df$target[df$session == 1 & df$minute == 1]-1
+
+#Deal with aborted sessions. NA out bin at time of session abortion
+for(j in 1:10){
+for (h in 1:16){
+for(i in 1:max(df$minute[df$session == h], na.rm = TRUE)){
+  if(is.na(df$target[df$session == h & df$minute == i & as.numeric(gsub("TD", "", df$id)) == j]) == TRUE){
+    df[df$session == h &df$minute >= i-1  & as.numeric(gsub("TD", "", df$id)) == j,c(3:5)]<-NA
+    break
+  }
+ 
+}
+}
+}
+
+#Generate cumulative session and real time minutes across the session
+df$cum_min[df$session == 1]<-df$minute[df$session==1]
+df$real_time[df$session == 1]<-df$minute[df$session==1]
+for(j in 1:10){
+for (i in 2:max(df$session)){
+  
+suppressWarnings(ifelse(max(df$cum_min[df$session == i-1&as.numeric(gsub("TD", "", df$id)) == j], na.rm = TRUE) == -Inf,k <- 2, k <- 1))
+   df$cum_min[df$session == i & as.numeric(gsub("TD", "", df$id)) == j]<-df$minute[df$session == i&as.numeric(gsub("TD", "", df$id)) == j]+
+    max(df$cum_min[df$session == i-k&as.numeric(gsub("TD", "", df$id)) == j], na.rm = TRUE)
+
+df$real_time[df$session == i&as.numeric(gsub("TD", "", df$id)) == j]<-df$cum_min[df$session == i &as.numeric(gsub("TD", "", df$id)) == j]+times[[j]]$cum_time[i]  
+   
+   }
+}
+
+#Organize data frame and split into a df for each subject
+df<-df %>% group_by(id) %>% 
+    arrange(id, session)
+
+df_split<-split(df, df$id)
+openxlsx::write.xlsx(df_split, file = 'santi_burst.xlsx') 
+```
+

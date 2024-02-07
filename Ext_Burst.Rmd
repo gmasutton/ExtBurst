@@ -1,0 +1,301 @@
+---
+title: "ExtBurst"
+output: pdf_document
+date: "2023-11-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(Lab.Data.Prep)
+library(hms)
+library(openxlsx)
+```
+
+```{r}
+raw<-Lab.Data.Prep::extract("CD",c(2,6,7,10),filepath = '/Users/admin/Documents/Ext_Burst/Raw/')
+```
+
+```{r}
+mpc_s <- function(x, array, timescale = "min", cummulative = TRUE) {
+  # parsing text array into a data frame
+  if (stringr::str_detect(array, "[:upper:]") == FALSE) {
+    array <- toupper(array)
+  }
+
+  startarray <- paste(array, ":", sep = "")
+  endarray <- paste(LETTERS[which(LETTERS == array) + 1L], ":", sep = "")
+  new_vec <- vector("list", length(x))
+  for (c in seq_along(x)) {
+    text_data <- data.frame()
+    text_data <- rbind(text_data, x[[c]])
+
+    suppressWarnings(split_data <- tidyr::separate(text_data,
+      col = 1,
+      into = c(
+        "Col1", "Col2", "Col3"
+      ),
+      sep = " +"
+    ))
+    id <- split_data[3, 2]
+    start_row <- which(split_data$Col1 == startarray)
+    end_row <- which(split_data$Col1 == endarray)
+    filtered_data <- dplyr::filter(
+      split_data,
+      dplyr::row_number() %in% (start_row + 1):(end_row - 1)
+    )
+    long_data <- data.frame()
+    row_index <- 1
+    for (i in seq_len(nrow(filtered_data))) {
+      for (j in 3:ncol(filtered_data)) {
+        long_data[row_index, 1] <- filtered_data[i, j]
+        row_index <- row_index + 1
+      }
+    }
+    long_data <- na.omit(long_data)
+    long_data <- transform(long_data, V1 = as.numeric(V1))
+
+    names(long_data)[1] <- "time_plus_event"
+
+    times_events <- data.frame(
+      time_stamps = numeric(),
+      event_tags = numeric()
+    )
+
+    for (i in seq_len(nrow(long_data))) {
+      times_events[i, 1] <- floor(long_data[i, 1])
+      times_events[i, 2] <- long_data[i, 1] - times_events[i, 1]
+    }
+
+    df <- round(times_events$event_tags, digits = 3)
+    df <- cbind(times_events, df)
+    df <- df[, c(1, 3)]
+    colnames(df) <- c("time_stamps", "event_tags")
+    df$event_tags <- as.factor(df$event_tags)
+    new_vec[[c]] <- df
+  }
+
+  # merge data frames from list into one data frame
+  merged_df <- do.call(rbind, Map(cbind, session = seq_along(new_vec), new_vec))
+  merged_df$id <- id
+
+  # convert time
+  switch(timescale,
+         "hour" = merged_df$time_stamps <- merged_df$time_stamps / 360000,
+         "min" = merged_df$time_stamps <- merged_df$time_stamps / 6000,
+         "sec" = merged_df$time_stamps <- merged_df$time_stamps / 100,
+         "cent" = merged_df$time_stamps <- merged_df$time_stamps,
+         warning(paste(
+           "Timescale argument", paste("'", timescale, "'", sep = ""),
+           "not recognized.
+                  Available arguments are: 'hour','min','sec','cent'.
+                  Centiseconds have been retained."
+         )))
+
+  # make time cumulative
+  j <- 2
+  if (cummulative == TRUE) {
+    for (j in 2:length(levels(as.factor(merged_df$session)))) {
+      merged_df$time_stamps[merged_df$session == j] <-
+        merged_df$time_stamps[merged_df$session == j] +
+        (max(merged_df$time_stamps[merged_df$session == j - 1]))
+    }
+  }
+
+  return(merged_df)
+}
+```
+
+```{r}
+start_times<- function(x) {
+end_time<-vector()
+  for (c in seq_along(x)) {
+    text_data <- data.frame()
+    text_data <- rbind(text_data, x[[c]])
+
+    suppressWarnings(split_data <- tidyr::separate(text_data,
+      col = 1,
+      into = c(
+        "Col1", "Col2", "Col3"
+      ),
+      sep = " +"
+    ))
+end_time[c]<-split_data[8,3]
+
+  }
+end_time<-as.POSIXct(end_time, format = "%H:%M:%S")
+start_time<-end_time-(60*5)
+start_time[length(x)]<-end_time[length(x)]-(60*11)
+start_time<-as_hms(start_time)
+end_time<-as_hms(end_time)
+start_end_time<-data.frame(start_time,end_time)
+start_end_time$diff[1]<-0
+for(i in 2:length(start_end_time$diff)){
+  start_end_time$diff[i]<-((start_end_time$start_time[i]-start_end_time$end_time[i-1])/60)+1440
+}
+return(start_end_time)
+}
+
+
+
+
+
+```
+
+```{r}
+times<-list()
+for(i in 1:length(raw)){
+  times[[i]]<-start_times(raw[[i]])
+times[[i]]$cum_time<-cumsum(times[[i]]$diff)
+}
+
+```
+
+#Cummulative (Bins are incorrect)
+```{r}
+test_raw<-list()
+for (i in 1:length(raw)) {
+  test_raw[[i]]<-mpc_s(raw[[i]],"d",cummulative = TRUE)
+  print(i)
+}
+
+dictionary<-c(
+  "0.2" = "Target_in_session",
+  "0.21" = "Target_in_food",
+  "0.4" = "Food"
+)
+defined_list<-list()
+for(i in 1:length(test_raw)){
+defined_list[[i]]<-var_def(test_raw[[i]], dictionary)
+defined_list[[i]]$total_target<-defined_list[[i]]$Target_in_session+defined_list[[i]]$Target_in_food
+defined_list[[i]]$total_target_cum<-cumsum(defined_list[[i]]$total_target)
+}
+
+binning<-list()
+for(i in 1:length(defined_list)){
+binning[[i]]<-defined_list[[i]][,c(1:3, 6, 10)]
+}
+
+for_export<-list()
+for(i in 1:length(binning)){
+  minutes<-sequence(((max(binning[[i]]$session)-1)*5)+11)
+for_export[[i]]<-data.frame(minutes)
+for_export[[i]]$id<-binning[[i]]$id[1]
+  for(j in 1:length(minutes)){
+  for_export[[i]]$target[minutes == j]<-sum(binning[[i]]$total_target[binning[[i]]$time_stamps>j-1 & binning[[i]]$time_stamps<=j])
+    if(for_export[[i]]$target[j] == -Inf){
+      for_export[[i]]$target[j] <- for_export[[i]]$target[j-1]
+    }
+  for_export[[i]]$food[minutes == j]<-sum(binning[[i]]$Food[binning[[i]]$time_stamps>j-1 & binning[[i]]$time_stamps<=j])
+    if(for_export[[i]]$food[j] == -Inf){
+      for_export[[i]]$food[j] <- for_export[[i]]$food[j-1]
+    }
+   for_export[[i]]$session[minutes == j]<-max(binning[[i]]$session[binning[[i]]$time_stamps>j-1 & binning[[i]]$time_stamps<=j])
+   if(for_export[[i]]$session[j] == -Inf){
+      for_export[[i]]$session[j] <- for_export[[i]]$session[j-1]
+    }
+  }
+for(h in 1:length(times[[i]]$end_time)){
+  for_export[[i]]$real_time[for_export[[i]]$session == h]<-for_export[[i]]$minutes[for_export[[i]]$session == h]+times[[i]]$cum_time[h]
+}
+
+for_export[[i]]<-for_export[[i]][,c(1,3:6)]
+for_export[[i]]<-for_export[[i]][,c(4,1,5,2,3)]
+}
+
+for_export <- list('CD2' = for_export[[1]], 'CD6' = for_export[[2]], 'CD7' = for_export[[3]],'CD10' = for_export[[4]])
+openxlsx::write.xlsx(for_export, file = 'Ext_Burst_Pilot.xlsx') 
+```
+#Non Cum to Correct Bins and Cut off any time after 5 min
+```{r}
+test_raw<-list()
+for (i in 1:length(raw)) {
+  test_raw[[i]]<-mpc_s(raw[[i]],"d",cummulative = FALSE)
+  print(i)
+}
+
+test_raw_cut<-list()
+for(i in 1:length(test_raw)){
+ 
+test_raw_cut[[i]]<-test_raw[[i]][(test_raw[[i]]$session<max(test_raw[[i]]$session)&test_raw[[i]]$time_stamps<=5)|
+               (test_raw[[i]]$session==max(test_raw[[i]]$session)&test_raw[[i]]$time_stamps<=11),]
+
+}
+
+
+
+dictionary<-c(
+  "0.2" = "Target_in_session",
+  "0.21" = "Target_in_food",
+  "0.4" = "Food"
+)
+defined_list_cut<-list()
+for(i in 1:length(test_raw_cut)){
+defined_list_cut[[i]]<-var_def(test_raw_cut[[i]], dictionary, cumulative = FALSE)
+defined_list_cut[[i]]$total_target<-defined_list_cut[[i]]$Target_in_session+defined_list_cut[[i]]$Target_in_food
+print(i)
+}
+
+dfc<-defined_list_cut
+for(i in 1:length(defined_list_cut)){
+
+      for (j in 2:length(levels(as.factor(defined_list_cut[[i]]$session)))) {
+     dfc[[i]]$time_stamps[dfc[[i]]$session == j] <-
+       dfc[[i]]$time_stamps[dfc[[i]]$session == j] +
+        (ceiling(max(dfc[[i]]$time_stamps[dfc[[i]]$session == j - 1])))
+    }
+}
+
+binning<-list()
+for(i in 1:length(dfc)){
+binning[[i]]<-dfc[[i]][,c(1:3, 6, 7)]
+}
+
+for_export<-list()
+for(i in 1:length(binning)){
+  minutes<-sequence(((max(binning[[i]]$session)-1)*5)+11)
+for_export[[i]]<-data.frame(minutes)
+for_export[[i]]$id<-binning[[i]]$id[1]
+  for(j in 1:length(minutes)){
+  for_export[[i]]$target[minutes == j]<-sum(binning[[i]]$total_target[binning[[i]]$time_stamps>=j-1 & binning[[i]]$time_stamps<j])
+    if(for_export[[i]]$target[j] == -Inf){
+      for_export[[i]]$target[j] <- for_export[[i]]$target[j-1]
+    }
+  for_export[[i]]$food[minutes == j]<-sum(binning[[i]]$Food[binning[[i]]$time_stamps>=j-1 & binning[[i]]$time_stamps<j])
+    if(for_export[[i]]$food[j] == -Inf){
+      for_export[[i]]$food[j] <- for_export[[i]]$food[j-1]
+    }
+   for_export[[i]]$session[minutes == j]<-max(binning[[i]]$session[binning[[i]]$time_stamps>=j-1 & binning[[i]]$time_stamps<j])
+   if(for_export[[i]]$session[j] == -Inf){
+      for_export[[i]]$session[j] <- for_export[[i]]$session[j-1]
+    }
+  }
+for(h in 1:length(times[[i]]$end_time)){
+  for_export[[i]]$real_time[for_export[[i]]$session == h]<-for_export[[i]]$minutes[for_export[[i]]$session == h]+times[[i]]$cum_time[h]
+}
+
+for_export[[i]]<-for_export[[i]][,c(1,3:6)]
+for_export[[i]]<-for_export[[i]][,c(4,1,5,2,3)]
+}
+
+for_export <- list('CD2' = for_export[[1]], 'CD6' = for_export[[2]], 'CD7' = for_export[[3]],'CD10' = for_export[[4]])
+openxlsx::write.xlsx(for_export, file = 'Ext_Burst_Pilot.xlsx') 
+```
+
+```{r}
+cd2<-select(defined_list[[1]], "total_target_cum")
+cd6<-select(defined_list[[2]], "total_target_cum")
+cd10<-select(defined_list[[3]], "total_target_cum")
+plot(cd2)
+plot(cd6)
+plot(cd10)
+
+for_export[[1]] %>% 
+  ggplot(aes( x = real_time, y = target))+
+  geom_step()
+```
+
